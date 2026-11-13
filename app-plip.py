@@ -1,15 +1,14 @@
 # coding=utf-8
 import streamlit as st
-import streamlit.components.v1 as components
 import py3Dmol
 import subprocess
 import os
 import xml.etree.ElementTree as ET
-import gemmi
 import tempfile
 import glob
 import math
 import base64
+import sys
 
 # ================= UI 设置 =================
 st.set_page_config(page_title="ComplexViewer Pro", layout="wide")
@@ -106,7 +105,8 @@ def run_plip(pdb_string):
         with open(wrapper_path, "w", encoding="utf-8") as f:
             f.write(f"import sys\nfrom plip.plipcmd import main\nsys.argv = ['plip', '-f', r'{pdb_path}', '-x', '-o', r'{tmpdir}']\nmain()\n")
         
-        res = subprocess.run(["python", wrapper_path], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # 核心修正：使用 sys.executable 强制指向 Streamlit Cloud 的虚拟环境 Python
+        res = subprocess.run([sys.executable, wrapper_path], capture_output=True, text=True, encoding="utf-8", errors="replace")
         xml_files = glob.glob(os.path.join(tmpdir, "*.xml"))
         if xml_files: return ET.parse(xml_files[0]).getroot()
         return None
@@ -148,9 +148,10 @@ def parse_interactions(xml_root, target_chain):
             interactions.append(('Halogen-Bond', lig_coo, prot_coo, 'purple', get_lbl(hlx)))
     return interactions
 
-# ================= 核心创新：调用后台 PyMOL 引擎进行物理裁切 =================
+# ================= 调用后台 PyMOL 引擎进行物理裁切 =================
 @st.cache_data
 def process_density_with_pymol(pdb_bytes, map_bytes, filename, lig_name, radius):
+    import gemmi
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "complex.pdb")
         with open(pdb_path, "wb") as f: f.write(pdb_bytes)
@@ -174,7 +175,6 @@ def process_density_with_pymol(pdb_bytes, map_bytes, filename, lig_name, radius)
             
         out_ccp4 = os.path.join(tmpdir, "carved.ccp4")
         
-        # 构建并运行 PyMOL 脚本
         pml_script = f"""
 load {pdb_path}, complex_obj
 load {map_path}, density_map
@@ -186,7 +186,6 @@ quit
         pml_path = os.path.join(tmpdir, "run.pml")
         with open(pml_path, "w", encoding="utf-8") as f: f.write(pml_script)
         
-        # 调用无头模式的 PyMOL
         subprocess.run(["pymol", "-c", "-q", pml_path], capture_output=True)
         
         if os.path.exists(out_ccp4):
@@ -290,7 +289,6 @@ if pdb_file is not None:
                     var len = binary_string.length;
                     var bytes = new Uint8Array(len);
                     for (var i = 0; i < len; i++) {{ bytes[i] = binary_string.charCodeAt(i); }}
-                    // 核心：直接渲染 PyMOL 切割好的极纯净 map，应用镂空文献风格！
                     var volspec = {{isoval: {isolevel}, color: "{mesh_color}", opacity: 0.6, wireframe: true}};
                     viewer.addVolumetricData(bytes.buffer, "ccp4", volspec);
                     viewer.render();
@@ -347,9 +345,9 @@ if pdb_file is not None:
         """
         
         inject_html = export_html + density_js
-        if "<body>" in html_str: html_str = html_str.replace("<body>", "<body>\n" + inject_html)
-        else: html_str = inject_html + html_str
-        components.html(html_str, width=900, height=700)
+        
+        # 兼容最新版 Streamlit 的 HTML 组件渲染
+        st.components.v1.html(html_str.replace("<body>", "<body>\n" + inject_html), width=900, height=700)
 
     with col2:
         st.subheader("📊 单一链位点互作统计")
@@ -358,7 +356,7 @@ if pdb_file is not None:
         if counts:
             for k, v in counts.items(): st.metric(label=f"{k} 数量", value=v)
         else: st.info("💡 当前链未检测到显著作用力。")
-        if xml_root is None: st.error("PLIP 运算失败。")
+        if xml_root is None: st.error("PLIP 运算失败，请检查 PDB 格式。")
         st.markdown("---")
         st.markdown('''**🔍 结构图例**\n* 🔘 **飘带**: 蛋白骨架\n* 🤍 **细棒**: 5Å 内口袋残基\n* 🧪 **粗棒**: 小分子配体''')
 else:
