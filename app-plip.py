@@ -7,9 +7,7 @@ import xml.etree.ElementTree as ET
 import tempfile
 import glob
 import math
-import base64
 import sys
-import gemmi
 
 # ================= UI 设置 =================
 st.set_page_config(page_title="ComplexViewer Pro", layout="wide")
@@ -18,8 +16,6 @@ st.title("🧬 ComplexViewer Pro - 蛋白与配体互作分析平台 (期刊发�
 # ================= 侧边栏：数据输入 =================
 st.sidebar.header("📁 1. 数据输入")
 pdb_file = st.sidebar.file_uploader("上传复合物 PDB 文件", type=["pdb"])
-density_file = st.sidebar.file_uploader("上传原始衍射电子密度图 (.mtz/.ccp4/.map)", type=["mtz", "ccp4", "map"])
-st.sidebar.info("💡 提示：本平台现采用底层 WebGL 着色器实时渲染引擎，您可以直接上传全局原始 .mtz 文件。系统将调用 GPU 为您生成只包裹配体的完美顶刊级镂空网格！")
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔧 2. 配体残基识别")
@@ -52,29 +48,23 @@ style_mode = st.sidebar.radio("选择显示风格 (Style):", [
 
 bg_color, prot_color, prot_style, prot_opacity = "white", "gray", "cartoon", 0.7
 lig_color, pocket_color = "cyanCarbon", "whiteCarbon"
-label_bg, label_color, mesh_color = "white", "black", "blue"
+label_bg, label_color = "white", "black"
 
 if style_mode == "📝 JACS / JMC 极简风 (Minimalist)":
     prot_color, prot_style, prot_opacity = "lightgray", "line", 1.0
-    lig_color, pocket_color, mesh_color = "orangeCarbon", "greenCarbon", "#3366ff"
+    lig_color, pocket_color = "orangeCarbon", "greenCarbon"
 elif style_mode == "🧪 Nature / Cell 高级黑 (Dark Mode)":
     bg_color, prot_color, prot_opacity = "#121212", "#444444", 0.9
-    lig_color, pocket_color, mesh_color = "greenCarbon", "grayCarbon", "cyan"
+    lig_color, pocket_color = "greenCarbon", "grayCarbon"
     label_bg, label_color = "black", "white"
 elif style_mode == "🧊 纯净白底水墨风 (Clean White)":
     prot_color, prot_opacity = "white", 1.0
-    lig_color, pocket_color, mesh_color = "yellowCarbon", "tealCarbon", "darkblue"
+    lig_color, pocket_color = "yellowCarbon", "tealCarbon"
 
 # ================= 侧边栏：视角控制 =================
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 5. 快速视角定位")
 view_focus = st.sidebar.radio("选择聚焦:", ["🧪 当前位点配体", "🕳️ 当前结合口袋", "🌍 全局复合物"], horizontal=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("☁️ 6. 电子密度网格 (GPU Shader 渲染)")
-show_density = st.sidebar.checkbox("启用完美包裹配体的电子云 (防遮挡)", value=True)
-carve_radius = st.sidebar.slider("WebGL 裁切包围盒 (Box Radius, Å)", min_value=1.0, max_value=5.0, value=3.0, step=0.1)
-isolevel = st.sidebar.slider("网格阈值 (Sigma / Level)", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
 
 # ================= 核心分析引擎 =================
 def fix_pdb_ligand(pdb_string, lig_name):
@@ -96,26 +86,6 @@ def get_ligand_chains(pdb_string, lig_name):
             if line[17:20].strip() == lig_name: chains.add(line[21].strip())
     return sorted(list(chains))
 
-# 获取配体的三维绝对坐标，用于传递给前端 WebGL 生成裁剪用的物理包围盒
-def get_ligand_extent(pdb_string, target_ligand, target_chain, expand=3.0):
-    coords = []
-    for line in pdb_string.split('\n'):
-        if (line.startswith('ATOM') or line.startswith('HETATM')) and len(line) >= 54:
-            resn = line[17:20].strip()
-            chain = line[21].strip()
-            if resn == target_ligand and (not target_chain or chain == target_chain):
-                try:
-                    coords.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
-                except ValueError: pass
-    if not coords: return None, None
-    min_x = min(c[0] for c in coords) - expand
-    min_y = min(c[1] for c in coords) - expand
-    min_z = min(c[2] for c in coords) - expand
-    max_x = max(c[0] for c in coords) + expand
-    max_y = max(c[1] for c in coords) + expand
-    max_z = max(c[2] for c in coords) + expand
-    return (min_x, min_y, min_z), (max_x, max_y, max_z)
-
 @st.cache_data
 def run_plip(pdb_string):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -126,7 +96,6 @@ def run_plip(pdb_string):
         with open(wrapper_path, "w", encoding="utf-8") as f:
             f.write(f"import sys\nfrom plip.plipcmd import main\nsys.argv = ['plip', '-f', r'{pdb_path}', '-x', '-o', r'{tmpdir}']\nmain()\n")
         
-        # 强制使用当前环境 python (彻底修复流环境报错)
         res = subprocess.run([sys.executable, wrapper_path], capture_output=True, text=True, encoding="utf-8", errors="replace")
         xml_files = glob.glob(os.path.join(tmpdir, "*.xml"))
         if xml_files: return ET.parse(xml_files[0]).getroot()
@@ -168,28 +137,6 @@ def parse_interactions(xml_root, target_chain):
             prot_coo = [float(hlx.find(f'protcoo/{a}').text) for a in ('x', 'y', 'z')]
             interactions.append(('Halogen-Bond', lig_coo, prot_coo, 'purple', get_lbl(hlx)))
     return interactions
-
-@st.cache_data
-def process_density_safe(map_bytes, filename):
-    # 安全处理，仅转换 MTZ 格式至 CCP4 二进制流，放弃在后端做危险截取
-    if filename.lower().endswith('.mtz'):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mtz_path = os.path.join(tmpdir, "density.mtz")
-            with open(mtz_path, "wb") as f: f.write(map_bytes)
-            mtz = gemmi.read_mtz_file(mtz_path)
-            try: grid = mtz.transform_f_phi_to_map('FWT', 'PHWT', sample_rate=3)
-            except:
-                try: grid = mtz.transform_f_phi_to_map('2FOFCWT', 'PH2FOFCWT', sample_rate=3)
-                except: return None
-            grid.normalize()
-            ccp4 = gemmi.Ccp4Map()
-            ccp4.grid = grid
-            ccp4.update_ccp4_header()
-            map_path = os.path.join(tmpdir, "density.map")
-            ccp4.write_ccp4_map(map_path)
-            with open(map_path, "rb") as f: return f.read()
-    else:
-        return map_bytes
 
 # ================= 动态解析与 UI 衔接 =================
 raw_pdb_str, clean_pdb_str, target_chain = "", "", ""
@@ -260,62 +207,8 @@ if pdb_file is not None:
         elif view_focus == "🕳️ 当前结合口袋": view.zoomTo(pocket_sel)
         else: view.zoomTo()
 
-        # ================= 解析密度并发送给前端渲染 =================
-        map_data_b64 = ""
-        box_js = ""
-        if density_file is not None and show_density:
-            with st.spinner("🚀 正在加载原始电子云并呼叫底层着色器，请稍候..."):
-                map_data = process_density_safe(density_file.getvalue(), density_file.name)
-                if map_data:
-                    map_data_b64 = base64.b64encode(map_data).decode("utf-8")
-                    min_c, max_c = get_ligand_extent(clean_pdb_str, target_ligand, target_chain, expand=carve_radius)
-                    # 极度黑科技：提取物理包围盒传给前端，强制 WebGL 进行区域着色与视觉剔除！
-                    if min_c and max_c:
-                        box_js = f"""
-                        var bbox = {{
-                            min: {{x: {min_c[0]}, y: {min_c[1]}, z: {min_c[2]}}},
-                            max: {{x: {max_c[0]}, y: {max_c[1]}, z: {max_c[2]}}}
-                        }};
-                        """
-                else: st.warning("⚠️ 密度图解析失败，请检查文件格式。")
-
-        # ================= HTML / JS 截屏与物理包围盒渲染注入 =================
+        # ================= HTML / JS 截屏注入 =================
         html_str = view._make_html()
-        
-        density_js = ""
-        if map_data_b64:
-            density_js = f"""
-            <script>
-            function loadDensity() {{
-                var viewer = null;
-                for (var key in window) {{
-                    if (key.indexOf('viewer_') === 0 && window[key] && typeof window[key].pngURI === 'function') {{ viewer = window[key]; break; }}
-                }}
-                if (!viewer) {{ setTimeout(loadDensity, 200); return; }}
-                try {{
-                    var binary_string = window.atob("{map_data_b64}");
-                    var len = binary_string.length;
-                    var bytes = new Uint8Array(len);
-                    for (var i = 0; i < len; i++) {{ bytes[i] = binary_string.charCodeAt(i); }}
-                    
-                    {box_js}
-                    
-                    // 彻底抛弃低效的 sel 匹配，直接利用 WebGL 底层的物理 extent 控制边界
-                    // 这与高端科研软件渲染配体周围云图的底层算法一模一样，防遮挡效果堪称完美！
-                    var volspec = {{isoval: {isolevel}, color: "{mesh_color}", opacity: 0.6, wireframe: true}};
-                    if (typeof bbox !== 'undefined') {{
-                        volspec.extent = [
-                            [bbox.min.x, bbox.min.y, bbox.min.z],
-                            [bbox.max.x, bbox.max.y, bbox.max.z]
-                        ];
-                    }}
-                    viewer.addVolumetricData(bytes.buffer, "ccp4", volspec);
-                    viewer.render();
-                }} catch (err) {{ console.error("密度渲染错误: " + err.message); }}
-            }}
-            loadDensity();
-            </script>
-            """
             
         export_html = f"""
         <div style="position: absolute; top: 15px; left: 15px; z-index: 2147483647; pointer-events: auto;">
@@ -363,9 +256,7 @@ if pdb_file is not None:
         </script>
         """
         
-        inject_html = export_html + density_js
-        
-        # 兼容最新版 Streamlit (修复框架替换弃用警告)
+        inject_html = export_html
         st.components.v1.html(html_str.replace("<body>", "<body>\n" + inject_html), width=900, height=700)
 
     with col2:
