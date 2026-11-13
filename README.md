@@ -1,0 +1,2 @@
+# Structure-Analyse
+personal use
