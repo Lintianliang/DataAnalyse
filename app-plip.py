@@ -18,7 +18,7 @@ st.title("🧬 ComplexViewer Pro - 蛋白与配体互作分析平台 (期刊发�
 st.sidebar.header("📁 1. 数据输入")
 pdb_file = st.sidebar.file_uploader("上传复合物 PDB 文件", type=["pdb"])
 density_file = st.sidebar.file_uploader("上传原始衍射电子密度图 (.mtz/.ccp4/.map)", type=["mtz", "ccp4", "map"])
-st.sidebar.info("💡 提示：现已整合 PyMOL 云端处理引擎。直接上传全局 .mtz 文件，系统将在后台自动精准剥离配体周围的局域密度网格，彻底告别全局噪点遮挡！")
+st.sidebar.info("💡 提示：现已整合纯 Python 原生物理裁切引擎。直接上传全局 .mtz 文件，系统将在后台自动精准剥离配体周围的局域密度网格，无需依赖 PyMOL！")
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔧 2. 配体残基识别")
@@ -70,9 +70,9 @@ st.sidebar.header("🎯 5. 快速视角定位")
 view_focus = st.sidebar.radio("选择聚焦:", ["🧪 当前位点配体", "🕳️ 当前结合口袋", "🌍 全局复合物"], horizontal=True)
 
 st.sidebar.markdown("---")
-st.sidebar.header("☁️ 6. 电子密度网格 (PyMOL 引擎)")
-show_density = st.sidebar.checkbox("显示已裁切的局域密度网格", value=True)
-carve_radius = st.sidebar.slider("PyMOL 裁切半径 (Carve, Å)", min_value=1.0, max_value=4.0, value=1.6, step=0.1)
+st.sidebar.header("☁️ 6. 电子密度网格 (原生 Python 切割)")
+show_density = st.sidebar.checkbox("显示局域密度网格", value=True)
+carve_radius = st.sidebar.slider("裁切半径 (Carve, Å)", min_value=1.0, max_value=4.0, value=1.6, step=0.1)
 isolevel = st.sidebar.slider("网格阈值 (Sigma / Level)", min_value=0.5, max_value=3.0, value=1.2, step=0.1)
 
 # ================= 核心分析引擎 =================
@@ -105,7 +105,7 @@ def run_plip(pdb_string):
         with open(wrapper_path, "w", encoding="utf-8") as f:
             f.write(f"import sys\nfrom plip.plipcmd import main\nsys.argv = ['plip', '-f', r'{pdb_path}', '-x', '-o', r'{tmpdir}']\nmain()\n")
         
-        # 核心修正：使用 sys.executable 强制指向 Streamlit Cloud 的虚拟环境 Python
+        # 核心修复 1：采用 sys.executable 确保云端虚拟环境能准确命中 PLIP！
         res = subprocess.run([sys.executable, wrapper_path], capture_output=True, text=True, encoding="utf-8", errors="replace")
         xml_files = glob.glob(os.path.join(tmpdir, "*.xml"))
         if xml_files: return ET.parse(xml_files[0]).getroot()
@@ -148,10 +148,12 @@ def parse_interactions(xml_root, target_chain):
             interactions.append(('Halogen-Bond', lig_coo, prot_coo, 'purple', get_lbl(hlx)))
     return interactions
 
-# ================= 调用后台 PyMOL 引擎进行物理裁切 =================
+# ================= 核心修复 2：原生 Python 物理切割，告别 PyMOL 崩溃 =================
 @st.cache_data
-def process_density_with_pymol(pdb_bytes, map_bytes, filename, lig_name, radius):
+def process_density_native(pdb_bytes, map_bytes, filename, lig_name, target_chain, radius):
     import gemmi
+    import numpy as np
+    
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "complex.pdb")
         with open(pdb_path, "wb") as f: f.write(pdb_bytes)
@@ -165,31 +167,46 @@ def process_density_with_pymol(pdb_bytes, map_bytes, filename, lig_name, radius)
             except:
                 try: grid = mtz.transform_f_phi_to_map('2FOFCWT', 'PH2FOFCWT', sample_rate=3)
                 except: return None
-            grid.normalize()
             ccp4 = gemmi.Ccp4Map()
             ccp4.grid = grid
             ccp4.update_ccp4_header()
-            ccp4.write_ccp4_map(map_path)
         else:
             with open(map_path, "wb") as f: f.write(map_bytes)
+            ccp4 = gemmi.read_ccp4_map(map_path)
             
-        out_ccp4 = os.path.join(tmpdir, "carved.ccp4")
+        # 极度关键：归一化处理，将密度数据转为标准 Z-score (sigma)
+        ccp4.grid.normalize()
         
-        pml_script = f"""
-load {pdb_path}, complex_obj
-load {map_path}, density_map
-select my_ligand, resn {lig_name} and complex_obj
-map_trim density_map, my_ligand, {radius}
-save {out_ccp4}, density_map
-quit
-"""
-        pml_path = os.path.join(tmpdir, "run.pml")
-        with open(pml_path, "w", encoding="utf-8") as f: f.write(pml_script)
+        # 构建物理空间蒙版
+        st_gemmi = gemmi.read_structure(pdb_path)
+        mask = gemmi.Int8Grid(ccp4.grid.nu, ccp4.grid.nv, ccp4.grid.nw)
+        mask.spacegroup = ccp4.grid.spacegroup
+        mask.set_unit_cell(ccp4.grid.unit_cell)
+        mask.fill(0)
         
-        subprocess.run(["pymol", "-c", "-q", pml_path], capture_output=True)
+        found_ligand = False
+        for model in st_gemmi:
+            for chain in model:
+                if target_chain and chain.name != target_chain: continue
+                for res in chain:
+                    if res.name == lig_name:
+                        for atom in res:
+                            # 激活配体周围指定半径的网格点
+                            mask.set_points_around(atom.pos, radius=radius, value=1)
+                            found_ligand = True
         
-        if os.path.exists(out_ccp4):
+        if found_ligand:
+            grid_arr = np.array(ccp4.grid, copy=False)
+            mask_arr = np.array(mask, copy=False)
+            # 强力清除杂音：将配体盒子外的全局数据强行归零！
+            # 归一化后的零点就是背景底噪，前端渲染只要 isolevel > 0.5，背景将瞬间隐形！
+            grid_arr[mask_arr == 0] = 0.0
+            ccp4.update_ccp4_header()
+            
+            out_ccp4 = os.path.join(tmpdir, "carved.ccp4")
+            ccp4.write_ccp4_map(out_ccp4)
             with open(out_ccp4, "rb") as f: return f.read()
+            
         return None
 
 # ================= 动态解析与 UI 衔接 =================
@@ -261,15 +278,15 @@ if pdb_file is not None:
         elif view_focus == "🕳️ 当前结合口袋": view.zoomTo(pocket_sel)
         else: view.zoomTo()
 
-        # ================= 调用 PyMOL 生成纯净局域网格 =================
+        # ================= 调用原生 Python 算法生成局域网格 =================
         map_data_b64 = ""
         if density_file is not None and show_density:
-            with st.spinner(f"🚀 正在后台调用 PyMOL 引擎切取配体 {carve_radius} Å 内纯净电子云..."):
-                map_data = process_density_with_pymol(
-                    pdb_file.getvalue(), density_file.getvalue(), density_file.name, target_ligand, carve_radius
+            with st.spinner(f"🚀 正在后台物理切割配体 {carve_radius} Å 内纯净电子云..."):
+                map_data = process_density_native(
+                    pdb_file.getvalue(), density_file.getvalue(), density_file.name, target_ligand, target_chain, carve_radius
                 )
                 if map_data: map_data_b64 = base64.b64encode(map_data).decode("utf-8")
-                else: st.warning("⚠️ 密度图解析失败，请确保云端环境已配置 packages.txt")
+                else: st.warning("⚠️ 密度图解析失败，请检查上传的文件是否正确。")
 
         # ================= HTML / JS 截屏与网格渲染注入 =================
         html_str = view._make_html()
@@ -289,6 +306,7 @@ if pdb_file is not None:
                     var len = binary_string.length;
                     var bytes = new Uint8Array(len);
                     for (var i = 0; i < len; i++) {{ bytes[i] = binary_string.charCodeAt(i); }}
+                    // 核心：直接渲染已强制归零背景的完美局部 Map，应用镂空文献风格！
                     var volspec = {{isoval: {isolevel}, color: "{mesh_color}", opacity: 0.6, wireframe: true}};
                     viewer.addVolumetricData(bytes.buffer, "ccp4", volspec);
                     viewer.render();
@@ -346,7 +364,7 @@ if pdb_file is not None:
         
         inject_html = export_html + density_js
         
-        # 兼容最新版 Streamlit 的 HTML 组件渲染
+        # 兼容最新版 Streamlit (修复弃用警告)
         st.components.v1.html(html_str.replace("<body>", "<body>\n" + inject_html), width=900, height=700)
 
     with col2:
