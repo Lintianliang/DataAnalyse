@@ -1,5 +1,9 @@
 streamlit
-py3Dmol
-gemmi
-plip
+pandas
 numpy
+matplotlib
+scipy
+plotly
+openpyxl
+fabio
+scikit-image
