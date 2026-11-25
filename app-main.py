@@ -107,6 +107,53 @@ def parse_scale_log(content):
             if l.startswith("All hkl"): data['mult_overall'] = l.split()[-1]
     return data
 
+def parse_staraniso_log(content):
+    data = {}
+    # 1. 提取晶胞参数与波长
+    m_cell_wave = re.search(
+        r'cell dimensions, wavelength:.*?\n\s*(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s*\n\s*(\d+\.\d+)',
+        content, re.DOTALL
+    )
+    if m_cell_wave:
+        data['a'], data['b'], data['c'] = m_cell_wave.group(1), m_cell_wave.group(2), m_cell_wave.group(3)
+        data['alpha'], data['beta'], data['gamma'] = m_cell_wave.group(4), m_cell_wave.group(5), m_cell_wave.group(6)
+        data['wavelength'] = m_cell_wave.group(7)
+
+    # 2. 提取空间群
+    m_sg = re.search(r"\* Space group\s*=\s*'([^']+)'", content)
+    if m_sg:
+        data['space_group'] = m_sg.group(1).strip()
+
+    # 3. 提取截断后的输出 MTZ 分辨率范围 (取最后一次匹配，即 WRITTEN OUTPUT MTZ FILE)
+    m_res_ranges = re.findall(r'\(\s*([\d\.]+)\s*-\s*([\d\.]+)\s*A\s*\)', content)
+    if m_res_ranges:
+        data['low_res'] = f"{float(m_res_ranges[-1][0]):.2f}"
+        data['high_res'] = f"{float(m_res_ranges[-1][1]):.2f}"
+        data['high_res_outer'] = data['high_res']
+
+    # 4. 解析各向异性/椭球截断统计表，提取 I/σI 和椭球完整度 (Cobs_ell)
+    table_match = re.search(
+        r'\$TABLE:\s*Statistics for isotropic, anisotropic & ellipsoidal diffraction cut-offs:.*?\$\$\s*\n\$\$(.*?)\$\$',
+        content, re.DOTALL
+    )
+    if table_match:
+        bin_lines = [l.split() for l in table_match.group(1).strip().splitlines() if l.strip()]
+        if bin_lines:
+            outer = bin_lines[-1]  # 最高分辨率壳层
+            if len(outer) >= 17:
+                data['isigi_outer'] = f"{float(outer[10]):.2f}"
+                data['comp_outer'] = f"{float(outer[16]) * 100:.1f}"
+
+    # 5. 提取 All data 汇总行
+    m_all = re.search(r'All data\s+((?:[-\d\.]+\s+){13}[-\d\.]+)', content)
+    if m_all:
+        parts = m_all.group(1).split()
+        if len(parts) >= 14:
+            data['isigi_overall'] = f"{float(parts[7]):.2f}"       # <I/sd>obs_sph
+            data['comp_overall'] = f"{float(parts[13]) * 100:.1f}"  # Cobs_ell (%)
+
+    return data
+
 def parse_pdb(content):
     data = {}
     if not content: return data
@@ -188,43 +235,24 @@ def build_table_data(dcoll, pdb, phenix, custom_wavelength="0.9792"):
     ]
 
 @st.cache_data
-def draw_table_to_buffer(table_content, style="Nature/Cell 风格 (经典三线表)"):
+def draw_table_to_buffer(table_content):
     df = pd.DataFrame(table_content, columns=["Parameter", "Value"])
-    
-    # 动态行高调整
-    scale_y = 1.8
-    if style == "IUCr 风格 (紧凑型)": scale_y = 1.4
-    elif style == "Modern 风格 (灰底相间)": scale_y = 1.6
-        
-    fig, ax = plt.subplots(figsize=(8, len(df) * 0.35 * (scale_y/1.8) + 1))
+    fig, ax = plt.subplots(figsize=(8, len(df) * 0.35 + 1))
     ax.axis('off'); ax.axis('tight')
-    
     table = ax.table(cellText=df.values, loc='center', cellLoc='left')
-    table.auto_set_font_size(False); table.set_fontsize(11); table.scale(1, scale_y)
-    
+    table.auto_set_font_size(False); table.set_fontsize(11); table.scale(1, 1.8)
     for (row, col), cell in table.get_celld().items():
         cell.set_edgecolor('white'); cell.set_facecolor('white')
         text = cell.get_text().get_text()
-        
-        if style == "Modern 风格 (灰底相间)" and row > 0:
-            if row % 2 == 0: cell.set_facecolor('#F8F9FA')
-                
         if text in ["Data Collection", "Refinement"]:
             cell.set_text_props(weight='bold')
-            if style != "Modern 风格 (灰底相间)":
-                cell.set_edgecolor('black')
-                cell.visible_edges = 'TB'
-                cell.set_linewidth(1.0 if style == "IUCr 风格 (紧凑型)" else 1.5)
-                
+            cell.set_edgecolor('black'); cell.visible_edges = 'TB'; cell.set_linewidth(1.5)
         if col == 0 and row > 0 and text not in ["Data Collection", "Wavelength (Å)", "Space group", "Cell parameters", "Resolution (Å)", "Rmerge (%)", "CC1/2", "I/σI", "Completeness (%)", "Redundancy", "Refinement", "No. reflections used/free", "Rwork / Rfree (%)", "R.m.s. deviations", "B-factors (Å²)", "No. atoms", "Ramachandran plot"]:
             cell.get_text().set_text("    " + text)
         if col == 0: cell.PAD = 0.05
-            
     for col in range(2):
-        top_width = 1.2 if style == "IUCr 风格 (紧凑型)" else 2.0
-        table.get_celld()[(0, col)].set_edgecolor('black'); table.get_celld()[(0, col)].visible_edges = 'T'; table.get_celld()[(0, col)].set_linewidth(top_width)
-        table.get_celld()[(len(df)-1, col)].set_edgecolor('black'); table.get_celld()[(len(df)-1, col)].visible_edges = 'B'; table.get_celld()[(len(df)-1, col)].set_linewidth(top_width)
-
+        table.get_celld()[(0, col)].set_edgecolor('black'); table.get_celld()[(0, col)].visible_edges = 'T'; table.get_celld()[(0, col)].set_linewidth(1.5)
+        table.get_celld()[(len(df)-1, col)].set_edgecolor('black'); table.get_celld()[(len(df)-1, col)].visible_edges = 'B'; table.get_celld()[(len(df)-1, col)].set_linewidth(1.5)
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=300, bbox_inches='tight')
@@ -236,9 +264,9 @@ def run_table1_module():
     st.title("💎 晶体衍射与精修数据汇总表 (Table 1)")
     st.info("""
     **📖 使用说明：** 为了生成准确无误的 Table 1，请**确保上传的文件均来源于同一套处理与精修流程**。
-    - **1. 数据收集日志 (必传)**：`aimless.log` (CCP4/Xia2/AutoPROC) 或 `scale.log` (HKL2000)。用于提取分辨率、Rmerge、CC1/2、完整度等指标。
-    - **2. Phenix 精修日志 (必传)**：精修完成后的 `.log` 文本。用于提取 Rwork/Rfree、原子数量、B 因子等。
-    - **3. 最终 PDB 结构文件 (推荐)**：即提交至数据库前的 `.pdb` 文件。包含最权威的晶胞参数及拉氏图数据。
+    - **1. 数据收集日志 (必传)**：`aimless.log` (CCP4/Xia2/AutoPROC)、`scale.log` (HKL2000) 或 `staraniso_alldata.log` (STARANISO)。用于提取分辨率、Rmerge、CC1/2、完整度等指标。
+    - **2. Phenix 精修日志 (必传)**：精修完成后的 `.log` 文本。用于提取 Rwork/Rfree、原子数量、B 因子等模型质量指标。
+    - **3. 最终 PDB 结构文件 (推荐)**：即提交至数据库前的 `.pdb` 文件。包含最权威的晶胞参数及拉氏图数据。（*若未上传，将智能尝试从前两份日志中降级抠取备用数据*）。
     """)
     
     example_path = "assets/example_table1.png"
@@ -247,17 +275,11 @@ def run_table1_module():
             st.image(example_path, caption="Standard Table 1 Output", use_container_width=True)
             
     col_up1, col_up2, col_up3 = st.columns(3)
-    with col_up1: upload_dcoll = st.file_uploader("1. 数据收集日志 (aimless/scale)", type=['log', 'sca', 'txt', 'out'])
+    with col_up1: upload_dcoll = st.file_uploader("1. 数据收集日志 (aimless/scale/staraniso)", type=['log', 'sca', 'txt', 'out'])
     with col_up2: upload_phenix = st.file_uploader("2. Phenix 精修日志 (*refine*.log)", type=['log', 'txt', 'out'])
     with col_up3: upload_pdb = st.file_uploader("3. 结构文件 (*.pdb)", type=['pdb'])
     
-    st.markdown("---")
-    col_cfg1, col_cfg2 = st.columns(2)
-    with col_cfg1:
-        custom_wave = st.text_input("💡 兜底自定义波长 (Å) *(若处理日志中无记录，将使用此值)*", value="0.9792")
-    with col_cfg2:
-        table_style = st.selectbox("🎨 图表风格预设", ["Nature/Cell 风格 (经典三线表)", "IUCr 风格 (紧凑型)", "Modern 风格 (灰底相间)"])
-        
+    custom_wave = st.text_input("💡 兜底自定义波长 (Å) *(若处理日志中无记录，将使用此值)*", value="0.9792")
     generate_btn = st.button("🚀 一键提取并生成 Table 1", type="primary", use_container_width=True)
 
     if generate_btn:
@@ -265,8 +287,13 @@ def run_table1_module():
         with st.spinner("正在并发解析各种特征数据..."):
             if upload_dcoll:
                 content_dcoll = upload_dcoll.getvalue().decode('utf-8', errors='ignore')
-                if 'AIMLESS' in content_dcoll or '<!--SUMMARY_BEGIN-->' in content_dcoll: dcoll_data = parse_aimless_log(content_dcoll)
-                elif 'Summary of reflections intensities and R-factors by shells' in content_dcoll: dcoll_data = parse_scale_log(content_dcoll)
+                if 'STARANISO' in content_dcoll:
+                    dcoll_data = parse_staraniso_log(content_dcoll)
+                    st.warning("ℹ️ 检测到 STARANISO 日志：已提取各向异性截断后的分辨率、I/σI 及椭球完整度；由于该日志不含未合并数据，Rmerge、CC1/2 和 Redundancy 将显示为 N/A。")
+                elif 'AIMLESS' in content_dcoll or '<!--SUMMARY_BEGIN-->' in content_dcoll:
+                    dcoll_data = parse_aimless_log(content_dcoll)
+                elif 'Summary of reflections intensities and R-factors by shells' in content_dcoll:
+                    dcoll_data = parse_scale_log(content_dcoll)
             if upload_pdb:
                 content_pdb = upload_pdb.getvalue().decode('utf-8', errors='ignore')
                 pdb_data = parse_pdb(content_pdb)
@@ -286,10 +313,10 @@ def run_table1_module():
                 st.subheader("📝 文本数据校验")
                 st.dataframe(pd.DataFrame(table_matrix, columns=["Parameter", "Value"]), use_container_width=True, height=750)
             with col_res2:
-                st.subheader("🖼️ 图表渲染结果")
+                st.subheader("🖼️ 期刊级图表渲染结果")
                 with st.spinner("正在渲染高分辨率图像..."):
-                    img_buffer = draw_table_to_buffer(table_matrix, style=table_style)
-                    st.image(img_buffer, caption=f"Table 1 ({table_style})", use_container_width=True)
+                    img_buffer = draw_table_to_buffer(table_matrix)
+                    st.image(img_buffer, caption="Table 1: Data collection and refinement statistics", use_container_width=True)
                     st.download_button("📥 下载高清 PNG (300 DPI)", data=img_buffer, file_name="Table1_Statistics.png", mime="image/png", type="primary", use_container_width=True)
 
 
@@ -459,7 +486,7 @@ def main():
     ])
     
     st.sidebar.markdown("---")
-    st.sidebar.caption("© 自动化分析平台")
+    st.sidebar.caption("© 2026 结构生物学自动化中心")
 
     if app_mode == "📊 模块 1：晶体衍射数据汇总表":
         run_table1_module()
@@ -468,3 +495,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```[cite: 1, 2]
