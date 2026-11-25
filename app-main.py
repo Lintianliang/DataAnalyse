@@ -495,4 +495,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```[cite: 1, 2]
